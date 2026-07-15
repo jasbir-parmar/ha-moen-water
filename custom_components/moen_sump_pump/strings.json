@@ -1,0 +1,22 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Moen Smart Water Setup",
+        "description": "Enter your Moen account credentials. This covers the Sump Pump Monitor, Flo Shutoff Valve, and leak detector pucks under one login.",
+        "data": {
+          "username": "Email",
+          "password": "Password",
+          "flo_location_id": "Flo location ID (optional -- only needed for shutoff valve/leak detector support; leave blank if you only have a sump pump monitor, or don't know it yet)"
+        }
+      }
+    },
+    "error": {
+      "invalid_auth": "Invalid username or password",
+      "unknown": "An unknown error occurred"
+    },
+    "abort": {
+      "already_configured": "This account is already configured"
+    }
+  }
+}

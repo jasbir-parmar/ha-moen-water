@@ -1,0 +1,809 @@
+"""The Moen Flo NAB Sump Pump Monitor integration."""
+from __future__ import annotations
+
+import asyncio
+import logging
+from datetime import timedelta
+
+import aiohttp
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import CONF_PASSWORD, CONF_USERNAME, Platform
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers.storage import Store
+from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
+
+from .api import MoenFloNABClient, MoenFloNABApiError, MoenFloNABMqttClient
+from .const import DOMAIN, FLO_DEFAULT_SCAN_INTERVAL, CONF_FLO_LOCATION_ID
+from .flo_classic_api import MoenFloClassicClient, FloClassicApiError
+from .statistics import async_import_pump_statistics
+
+_LOGGER = logging.getLogger(__name__)
+
+# Separate hass.data key for the classic Flo devices (shutoff valve + pucks),
+# kept apart from hass.data[DOMAIN] so the existing NAB/sump-pump platforms
+# (sensor.py, binary_sensor.py) don't need their coordinator-lookup pattern
+# changed. Both coordinators are set up from the same config entry / same
+# username+password, so this is still one login, one integration.
+DATA_FLO_CLASSIC = f"{DOMAIN}_flo_classic"
+
+PLATFORMS = [
+    Platform.SENSOR,
+    Platform.BINARY_SENSOR,
+    Platform.BUTTON,
+    Platform.UPDATE,
+    Platform.VALVE,
+]
+
+# Adaptive polling constants
+MIN_POLL_INTERVAL = 10  # Minimum polling interval in seconds
+MAX_POLL_INTERVAL = 300  # Maximum polling interval in seconds (5 minutes)
+ALERT_MAX_INTERVAL = 60  # Maximum interval when non-info alerts are active
+CYCLE_WINDOW_MINUTES = 15  # Look back window for counting recent cycles
+
+# Pump threshold detection constants
+PUMP_HISTORY_WINDOW = 20  # Number of recent cycles used to compute median pump on/off distances
+
+# Storage constants
+STORAGE_VERSION = 1
+STORAGE_KEY = "moen_sump_pump_thresholds"
+
+
+async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    """Set up Moen Flo NAB from a config entry."""
+    username = entry.data[CONF_USERNAME]
+    password = entry.data[CONF_PASSWORD]
+
+    session = async_get_clientsession(hass)
+    client = MoenFloNABClient(username, password, session)
+
+    # Authenticate
+    try:
+        await client.authenticate()
+    except MoenFloNABApiError as err:
+        _LOGGER.error("Failed to authenticate: %s", err)
+        return False
+
+    # Create coordinator
+    coordinator = MoenFloNABDataUpdateCoordinator(hass, client)
+
+    # Load persistent pump thresholds from storage
+    await coordinator.async_load_thresholds()
+
+    # Fetch initial data
+    await coordinator.async_config_entry_first_refresh()
+
+    hass.data.setdefault(DOMAIN, {})
+    hass.data[DOMAIN][entry.entry_id] = coordinator
+
+    # --- Classic Flo devices (shutoff valve + leak detector pucks) ---
+    # Uses the same username/password; if this account has no shutoff
+    # valve or pucks, the coordinator will simply come back with an empty
+    # device list and no extra entities will be created.
+    flo_classic_client = MoenFloClassicClient(
+        username, password, entry.data.get(CONF_FLO_LOCATION_ID)
+    )
+    flo_classic_coordinator = FloClassicDataUpdateCoordinator(hass, flo_classic_client)
+    try:
+        await flo_classic_coordinator.async_config_entry_first_refresh()
+    except Exception as err:  # noqa: BLE001 - don't fail sump pump setup over this
+        _LOGGER.warning(
+            "Could not set up classic Flo devices (shutoff valve/pucks) "
+            "for this account; continuing with sump pump only: %s",
+            err,
+        )
+        flo_classic_coordinator = None
+
+    hass.data.setdefault(DATA_FLO_CLASSIC, {})
+    hass.data[DATA_FLO_CLASSIC][entry.entry_id] = flo_classic_coordinator
+
+    # Forward to platforms
+    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+
+    return True
+
+
+async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    """Unload a config entry."""
+    unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+
+    if unload_ok:
+        coordinator = hass.data[DOMAIN].pop(entry.entry_id)
+        # Disconnect MQTT clients
+        await coordinator.disconnect_mqtt()
+        flo_coordinator = hass.data.get(DATA_FLO_CLASSIC, {}).pop(entry.entry_id, None)
+        if flo_coordinator is not None:
+            await flo_coordinator.client.async_close()
+
+    return unload_ok
+
+
+class FloClassicDataUpdateCoordinator(DataUpdateCoordinator):
+    """Coordinator for the classic Flo API (shutoff valve + leak detector pucks)."""
+
+    def __init__(self, hass: HomeAssistant, client: MoenFloClassicClient) -> None:
+        super().__init__(
+            hass,
+            _LOGGER,
+            name=f"{DOMAIN}_flo_classic",
+            update_interval=timedelta(seconds=FLO_DEFAULT_SCAN_INTERVAL),
+        )
+        self.client = client
+
+    async def _async_update_data(self) -> dict:
+        """Fetch shutoff valve + puck devices, keyed by device id."""
+        from .const import DEVICE_TYPE_SHUTOFF
+
+        try:
+            location_ids = await self.client.async_get_user_locations()
+            devices: dict = {}
+            for location_id in location_ids:
+                raw_devices = await self.client.async_get_location_devices(location_id)
+                for device in raw_devices:
+                    devices[device["id"]] = device
+
+            # Water usage is a separate call, not part of the device
+            # payload -- fetch it for shutoff valves only (pucks don't
+            # meter flow).
+            for device_id, device in devices.items():
+                if device.get("deviceType") == DEVICE_TYPE_SHUTOFF:
+                    mac = device.get("macAddress")
+                    if mac:
+                        usage_today = await self.client.async_get_water_consumption_today(mac)
+                        device["_water_used_today_gallons"] = usage_today
+
+            return devices
+        except FloClassicApiError as err:
+            raise UpdateFailed(f"Error communicating with classic Flo API: {err}") from err
+
+
+class MoenFloNABDataUpdateCoordinator(DataUpdateCoordinator):
+    """Class to manage fetching Moen Flo NAB data."""
+
+    def __init__(self, hass: HomeAssistant, client: MoenFloNABClient) -> None:
+        """Initialize."""
+        super().__init__(
+            hass,
+            _LOGGER,
+            name=DOMAIN,
+            update_interval=timedelta(seconds=MAX_POLL_INTERVAL),
+        )
+        self.client = client
+        self.devices = {}
+        self.mqtt_clients = {}  # Store MQTT clients per device
+        self._last_alert_state = {}  # Track alert states for adaptive polling
+        self._first_refresh = True  # Track if this is the first data fetch
+        self._notification_metadata = {}  # Cache notification ID to title mappings per device
+        self._pump_thresholds = {}  # Persistent pump on/off thresholds per device
+        self._distance_history = {}  # Track last 24 readings per device for event detection
+        self._pending_cycles = {}  # Transient mid-cycle detection state (not persisted)
+        self._store = Store(hass, STORAGE_VERSION, STORAGE_KEY)  # Persistent storage for thresholds
+        self._last_cycle_date = {}  # Most recent cycle date seen per device
+
+    async def async_load_thresholds(self) -> None:
+        """Load pump thresholds and distance history from persistent storage."""
+        data = await self._store.async_load()
+        if data:
+            self._pump_thresholds = data.get("thresholds", {})
+            self._distance_history = data.get("distance_history", {})
+            _LOGGER.info("Loaded pump thresholds for %d device(s) from storage", len(self._pump_thresholds))
+            _LOGGER.info("Loaded distance history for %d device(s) from storage", len(self._distance_history))
+            # Migrate from old scalar format (pump_on_distance/pump_off_distance) to history lists
+            for device_duid, thresholds in self._pump_thresholds.items():
+                if "pump_on_distance" in thresholds and "pump_on_history" not in thresholds:
+                    old_on = thresholds.pop("pump_on_distance", None)
+                    old_off = thresholds.pop("pump_off_distance", None)
+                    thresholds["pump_on_history"] = [old_on] if old_on is not None else []
+                    thresholds["pump_off_history"] = [old_off] if old_off is not None else []
+                    _LOGGER.info("Device %s: migrated thresholds from scalar to history format", device_duid)
+        else:
+            _LOGGER.debug("No stored pump thresholds found, starting fresh")
+
+    async def async_save_thresholds(self) -> None:
+        """Save pump thresholds and distance history to persistent storage."""
+        await self._store.async_save({
+            "thresholds": self._pump_thresholds,
+            "distance_history": self._distance_history
+        })
+        _LOGGER.debug("Saved pump thresholds for %d device(s) to storage", len(self._pump_thresholds))
+        _LOGGER.debug("Saved distance history for %d device(s) to storage", len(self._distance_history))
+
+    async def _async_update_data(self):
+        """Fetch data from API."""
+        try:
+            # Get list of locations (houses)
+            try:
+                locations = await self.client.get_locations()
+                _LOGGER.debug(f"Found {len(locations)} location(s)")
+            except Exception as err:
+                _LOGGER.warning(f"Failed to get locations: {err}")
+                locations = []
+
+            # Get list of all devices
+            devices_list = await self.client.get_devices()
+
+            # Filter to only NAB (sump pump monitor) devices
+            nab_devices = [d for d in devices_list if d.get("deviceType") == "NAB"]
+
+            if not nab_devices:
+                _LOGGER.warning("No NAB (sump pump monitor) devices found")
+                return {}
+
+            _LOGGER.debug(f"Found {len(nab_devices)} NAB device(s) out of {len(devices_list)} total devices")
+
+            data = {}
+
+            for device in nab_devices:
+                device_duid = device.get("duid")
+                client_id = device.get("clientId")
+                location_id = device.get("locationId")
+                federated_identity = device.get("federatedIdentity")
+
+                if not device_duid or not client_id:
+                    _LOGGER.warning("Device missing duid or clientId: %s", device)
+                    continue
+
+                # Set cognito identity ID for API calls that require it
+                # (pump cycles, environment data, pump health)
+                if federated_identity:
+                    self.client._cognito_identity_id = federated_identity
+                else:
+                    _LOGGER.warning("Device %s missing federatedIdentity, some API calls may fail", device_duid)
+
+                # Find the location name for this device
+                location_name = None
+                if location_id and locations:
+                    for loc in locations:
+                        if loc.get("locationId") == location_id:
+                            location_name = loc.get("nickname")
+                            break
+
+                # Store both IDs and location info for future use
+                device_data = {
+                    "duid": device_duid,
+                    "clientId": client_id,
+                    "locationId": location_id,
+                    "locationName": location_name,
+                    "info": device,
+                }
+
+                # Get/create MQTT client for this device
+                mqtt_client = self.mqtt_clients.get(device_duid)
+                if mqtt_client is None:
+                    mqtt_client = self.client.create_mqtt_client(client_id)
+                    if mqtt_client:
+                        # Connect to MQTT
+                        connected = await mqtt_client.connect()
+                        if connected:
+                            self.mqtt_clients[device_duid] = mqtt_client
+                            _LOGGER.info("Established MQTT connection for device %s", device_duid)
+                        else:
+                            _LOGGER.warning("Failed to connect MQTT for device %s, using REST fallback", device_duid)
+                            mqtt_client = None
+                elif mqtt_client.needs_reconnect():
+                    # Credentials expired, need to reconnect with fresh ID token
+                    _LOGGER.info("MQTT credentials expired for device %s, reconnecting", device_duid)
+                    try:
+                        # Ensure we have fresh tokens
+                        await self.client.authenticate()
+                        # Reconnect with new ID token
+                        reconnected = await mqtt_client.reconnect_with_new_token(self.client._id_token)
+                        if not reconnected:
+                            _LOGGER.warning("Failed to reconnect MQTT for device %s, using REST fallback", device_duid)
+                            mqtt_client = None
+                            # Remove from cache so we can try fresh connection next time
+                            self.mqtt_clients.pop(device_duid, None)
+                    except Exception as err:
+                        _LOGGER.error("Failed to reauthenticate during MQTT reconnect for device %s: %s. Using REST fallback", device_duid, err)
+                        mqtt_client = None
+                        # Remove from cache so we can try fresh connection next time
+                        self.mqtt_clients.pop(device_duid, None)
+
+                # Get live telemetry via MQTT
+                try:
+                    if mqtt_client and mqtt_client.is_connected:
+                        # Trigger fresh sensor reading via MQTT
+                        await mqtt_client.trigger_sensor_update("sens_on")
+                        # Wait for device to take reading and update shadow (~2 seconds)
+                        await asyncio.sleep(2)
+                        # Request shadow via MQTT to get the fresh reading
+                        await mqtt_client.request_shadow()
+                        # Wait for shadow response
+                        await asyncio.sleep(1)
+
+                        # Stop streaming to preserve battery
+                        await mqtt_client.trigger_sensor_update("updates_off")
+
+                        # Get shadow data from MQTT client
+                        reported = mqtt_client.last_shadow_data
+                        if reported:
+                            # Merge shadow data into device info
+                            device_data["info"]["crockTofDistance"] = reported.get(
+                                "crockTofDistance", device_data["info"].get("crockTofDistance")
+                            )
+                            device_data["info"]["droplet"] = reported.get(
+                                "droplet", device_data["info"].get("droplet")
+                            )
+                            device_data["info"]["connected"] = reported.get(
+                                "connected", device_data["info"].get("connected")
+                            )
+                            device_data["info"]["wifiRssi"] = reported.get(
+                                "wifiRssi", device_data["info"].get("wifiRssi")
+                            )
+                            device_data["info"]["batteryPercentage"] = reported.get(
+                                "batteryPercentage", device_data["info"].get("batteryPercentage")
+                            )
+                            device_data["info"]["powerSource"] = reported.get(
+                                "powerSource", device_data["info"].get("powerSource")
+                            )
+                            device_data["info"]["alerts"] = reported.get(
+                                "alerts", device_data["info"].get("alerts")
+                            )
+
+                            # Track water distance for threshold calculation
+                            distance = reported.get("crockTofDistance")
+                            if distance is not None:
+                                # Detect pump events for threshold learning
+                                self._detect_pump_events(device_duid, distance)
+
+                            _LOGGER.debug(
+                                "Updated device %s with MQTT shadow data (water level: %s mm)",
+                                device_duid,
+                                reported.get("crockTofDistance"),
+                            )
+                        else:
+                            _LOGGER.warning("No shadow data received from MQTT for device %s", device_duid)
+                    else:
+                        _LOGGER.warning("MQTT not connected for device %s, using cached telemetry data", device_duid)
+
+                except Exception as err:
+                    _LOGGER.warning(
+                        "Failed to get shadow data for device %s: %s", device_duid, err
+                    )
+
+                # Calculate pump thresholds from water distance history (updated by MQTT above)
+                device_data["pump_thresholds"] = self._calculate_pump_thresholds(device_duid)
+
+                # Get environment data (temp/humidity) using numeric ID
+                try:
+                    env_data = await self.client.get_device_environment(client_id)
+                    device_data["environment"] = env_data
+                except Exception as err:
+                    _LOGGER.warning(
+                        "Failed to get environment data for device %s: %s",
+                        device_duid,
+                        err,
+                    )
+                    device_data["environment"] = {}
+
+                # Get pump health data using numeric ID
+                try:
+                    health_data = await self.client.get_pump_health(client_id)
+                    device_data["pump_health"] = health_data
+                except Exception as err:
+                    _LOGGER.warning(
+                        "Failed to get pump health for device %s: %s", device_duid, err
+                    )
+                    device_data["pump_health"] = {}
+
+                # Get pump cycle history + last usage using numeric ID.
+                # Mirrors the app's OverviewFragment.updateDeviceState() flow:
+                #   1. enableDropletUpdates() → drop_on (device starts streaming state transitions)
+                #   2. [brief delay for device to flush pending pump events to backend]
+                #   3. fetch session history AND last usage (both after the flush)
+                #   4. updates_off (stop streaming to conserve battery during power outages)
+                try:
+                    try:
+                        await self.client.enable_droplet_updates(client_id)
+                        # Give the device time to push any buffered pump state transitions
+                        # to the backend before we fetch data.
+                        await asyncio.sleep(3)
+                    except Exception as err:
+                        _LOGGER.debug("enable_droplet_updates failed for %s: %s", device_duid, err)
+
+                    # Fetch last usage after drop_on flush
+                    try:
+                        last_usage = await self.client.get_last_usage(client_id)
+                        device_data["last_usage"] = last_usage
+                    except Exception as err:
+                        _LOGGER.warning(
+                            "Failed to get last usage for device %s: %s", device_duid, err
+                        )
+                        device_data["last_usage"] = {}
+
+                    # On first refresh, fetch all available cycles for statistics import
+                    # On subsequent updates, fetch last 50 cycles for incremental updates
+                    limit = 1000 if self._first_refresh else 50
+                    cycles = await self.client.get_pump_cycles(client_id, limit=limit)
+                    device_data["pump_cycles"] = cycles
+
+                    # Import statistics only when there are new cycles
+                    latest_date = cycles[0].get("date", "") if cycles else ""
+                    if cycles and (self._first_refresh or latest_date != self._last_cycle_date.get(device_duid)):
+                        device_name = device.get("nickname", f"Sump Pump {device_duid[:8]}")
+                        await async_import_pump_statistics(
+                            self.hass,
+                            device_duid,
+                            device_name,
+                            cycles,
+                        )
+                        self._last_cycle_date[device_duid] = latest_date
+
+                except Exception as err:
+                    _LOGGER.warning("Failed to get pump cycles for device %s: %s", device_duid, err)
+                    device_data["pump_cycles"] = []
+                finally:
+                    # Always stop streaming after we're done — mirrors app pausing overview.
+                    # Critical for battery conservation during power outages.
+                    try:
+                        await self.client.disable_droplet_updates(client_id)
+                    except Exception as err:
+                        _LOGGER.debug("disable_droplet_updates failed for %s: %s", device_duid, err)
+
+                # Get event logs for water detection using UUID
+                # NOTE: Event logs are also used to build notification metadata
+                try:
+                    events = await self.client.get_device_logs(device_duid, limit=50)
+                    device_data["event_logs"] = {"events": events}
+                except Exception as err:
+                    _LOGGER.warning(
+                        "Failed to get event logs for device %s: %s", device_duid, err
+                    )
+                    device_data["event_logs"] = {"events": []}
+
+                # Build notification metadata map (only once per device)
+                if device_duid not in self._notification_metadata:
+                    try:
+                        notification_map = await self.client.get_notification_metadata(device_duid)
+                        self._notification_metadata[device_duid] = notification_map
+                        _LOGGER.info(
+                            "Built notification metadata for device %s: %d types",
+                            device_duid[:8],
+                            len(notification_map)
+                        )
+                    except Exception as err:
+                        _LOGGER.warning(
+                            "Failed to build notification metadata for device %s: %s",
+                            device_duid,
+                            err
+                        )
+                        self._notification_metadata[device_duid] = {}
+
+                # Store notification metadata in device data for sensors to access
+                device_data["notification_metadata"] = self._notification_metadata.get(device_duid, {})
+
+                # Get active alerts from v2 API (replaces shadow alerts)
+                # This provides the same alert list as the mobile app
+                try:
+                    active_alerts_list = await self.client.get_active_alerts()
+
+                    # Filter to this device's alerts
+                    device_alerts = [
+                        alert for alert in active_alerts_list
+                        if str(alert.get("duid")) == str(client_id)
+                    ]
+
+                    # Convert list to dictionary format for sensor compatibility
+                    # Shadow format: {"262": {...}, "218": {...}}
+                    # ACTIVE format: [{...}, {...}] with severity included
+                    notification_metadata = device_data.get("notification_metadata", {})
+                    alerts_dict = {}
+                    for alert in device_alerts:
+                        alert_id = alert.get("id")
+                        if alert_id:
+                            # Severity comes from v2 API; fall back to notification_metadata
+                            severity = alert.get("severity") or notification_metadata.get(str(alert_id), {}).get("severity")
+                            alerts_dict[alert_id] = {
+                                "state": alert.get("state"),
+                                "timestamp": alert.get("time"),
+                                "severity": severity,
+                                "dismiss": alert.get("dismiss"),
+                                "title": alert.get("title"),
+                            }
+
+                    # Override shadow alerts with ACTIVE alerts
+                    device_data["info"]["alerts"] = alerts_dict
+
+                    _LOGGER.debug(
+                        "Updated device %s with %d active alert(s) from v2 API",
+                        device_duid[:8],
+                        len(alerts_dict)
+                    )
+                except Exception as err:
+                    _LOGGER.warning(
+                        "Failed to get active alerts for device %s: %s. Using shadow alerts.",
+                        device_duid,
+                        err
+                    )
+                    # Keep shadow alerts as fallback (already set above)
+
+                # Get firmware update status
+                try:
+                    firmware_info = await self.client.get_latest_firmware(client_id)
+                    device_data["firmware_info"] = firmware_info
+                except Exception as err:
+                    _LOGGER.warning(
+                        "Failed to get firmware info for device %s: %s", device_duid, err
+                    )
+                    device_data["firmware_info"] = {}
+
+                data[device_duid] = device_data
+
+                # Implement adaptive polling based on alert state
+                self._update_poll_interval(device_duid, device_data)
+
+            # Mark first refresh as complete
+            if self._first_refresh:
+                self._first_refresh = False
+                _LOGGER.info("Initial data fetch and statistics import complete")
+
+            return data
+
+        except MoenFloNABApiError as err:
+            raise UpdateFailed(f"Error communicating with API: {err}")
+
+    def _update_poll_interval(self, device_duid: str, device_data: dict):
+        """Update polling interval based on pump activity and active alerts.
+
+        Adaptive polling formula: interval = 180 / cycles_in_last_15_min
+        - Minimum: 10 seconds
+        - Maximum: 300 seconds (5 minutes)
+        - Alert override: 60 second maximum when non-info alerts are active
+        """
+        from datetime import datetime, timezone
+
+        # Count cycles in last 15 minutes
+        pump_cycles = device_data.get("pump_cycles", [])
+        now = datetime.now(timezone.utc)
+        recent_cycles = 0
+
+        for cycle in pump_cycles:
+            try:
+                cycle_time_str = cycle.get("date", "")
+                if cycle_time_str:
+                    cycle_time = datetime.fromisoformat(cycle_time_str.replace("Z", "+00:00"))
+                    minutes_ago = (now - cycle_time).total_seconds() / 60
+                    if minutes_ago <= CYCLE_WINDOW_MINUTES:
+                        recent_cycles += 1
+            except (ValueError, AttributeError):
+                continue
+
+        # Calculate base interval: 180 / cycles (with divide-by-zero protection)
+        if recent_cycles == 0:
+            calculated_interval = MAX_POLL_INTERVAL
+        else:
+            calculated_interval = 180 / recent_cycles
+
+        # Apply hard limits
+        calculated_interval = max(MIN_POLL_INTERVAL, min(calculated_interval, MAX_POLL_INTERVAL))
+
+        # Check for unacknowledged critical or warning alerts
+        alerts = device_data.get("info", {}).get("alerts")
+        if not isinstance(alerts, dict):
+            alerts = {}
+
+        notification_metadata = device_data.get("notification_metadata", {})
+        has_non_info_alert = False
+
+        for alert_id, alert_data in alerts.items():
+            state = alert_data.get("state", "")
+            # Only check unacknowledged alerts (matches mobile app behavior)
+            if "unlack" in state:
+                # Get severity from alert data (v2 API) or metadata
+                severity = alert_data.get("severity", "").lower()
+                if not severity and alert_id in notification_metadata:
+                    severity = notification_metadata[alert_id].get("severity", "").lower()
+
+                # Only cap polling for critical or warning severity
+                if severity in ["critical", "warning"]:
+                    has_non_info_alert = True
+                    break
+
+        # Apply alert override
+        if has_non_info_alert:
+            final_interval = min(calculated_interval, ALERT_MAX_INTERVAL)
+        else:
+            final_interval = calculated_interval
+
+        # Create timedelta
+        new_interval = timedelta(seconds=final_interval)
+
+        # Get previous interval for comparison
+        previous_interval = self.update_interval.total_seconds() if self.update_interval else MAX_POLL_INTERVAL
+
+        # Only update and log if interval changed significantly (>5 seconds difference)
+        if abs(final_interval - previous_interval) > 5:
+            self.update_interval = new_interval
+            alert_note = f" (capped by alerts)" if has_non_info_alert and final_interval == ALERT_MAX_INTERVAL else ""
+            _LOGGER.info(
+                "Device %s: %d cycles in last %d min → polling every %.0fs%s",
+                device_duid,
+                recent_cycles,
+                CYCLE_WINDOW_MINUTES,
+                final_interval,
+                alert_note
+            )
+
+    def _detect_pump_events(self, device_duid: str, current_distance: float) -> None:
+        """Detect pump cycles from sudden distance increases.
+
+        Uses a two-phase approach to avoid false detections from mid-cycle polls:
+
+        Phase 1 - Entry: A 20mm+ jump enters a pending state, locking pump_on at the
+        pre-jump reading and setting pump_off_candidate to the post-jump reading.
+
+        Phase 2 - Confirmation: Each subsequent reading either:
+          - Updates pump_off_candidate upward (>=15mm increase, pump still draining)
+          - Confirms the cycle immediately (any decrease, basin refilling = pump done)
+          - Increments a stable counter (<15mm change); confirms after 2 stable readings
+
+        Confirmed values are blended into stored thresholds using 95/5 weighting.
+        Pending state is not persisted and is cleared on restart.
+
+        Args:
+            device_duid: Device UUID
+            current_distance: Current water distance in mm
+        """
+        import time
+
+        # Initialize history for device if not present
+        if device_duid not in self._distance_history:
+            self._distance_history[device_duid] = []
+
+        history = self._distance_history[device_duid]
+
+        # Get previous reading before adding current
+        previous_distance = history[-1]["distance"] if history else None
+
+        # Add current reading to history
+        history.append({
+            "distance": current_distance,
+            "timestamp": time.time()
+        })
+
+        # Keep only last 24 readings
+        if len(history) > 24:
+            history.pop(0)
+
+        # Save history after each update to persist across restarts
+        self.hass.async_create_task(self.async_save_thresholds())
+
+        # Need previous reading to detect change
+        if previous_distance is None:
+            return
+
+        # Initialize thresholds if not present
+        if device_duid not in self._pump_thresholds:
+            self._pump_thresholds[device_duid] = {
+                "pump_on_history": [],
+                "pump_off_history": [],
+                "cycle_count": 0,
+                "last_cycle": None,
+            }
+
+        thresholds = self._pump_thresholds[device_duid]
+        delta = current_distance - previous_distance
+        pending = self._pending_cycles.get(device_duid)
+
+        if pending is not None:
+            # Phase 2: already in a pending cycle, track until confirmed
+            if delta >= 15:
+                # Pump still draining - update candidate and reset stable counter
+                pending["pump_off"] = current_distance
+                pending["stable_count"] = 0
+                _LOGGER.debug("Device %s: Pump still draining, pump_off candidate now %d mm",
+                              device_duid, int(current_distance))
+            elif delta < 0:
+                # Basin refilling - pump definitely done, confirm immediately
+                self._confirm_pump_cycle(device_duid, pending, thresholds, reason="basin refilling")
+                del self._pending_cycles[device_duid]
+            else:
+                # Flat/noisy reading - increment stable counter
+                pending["stable_count"] += 1
+                if pending["stable_count"] >= 2:
+                    self._confirm_pump_cycle(device_duid, pending, thresholds, reason="stable readings")
+                    del self._pending_cycles[device_duid]
+        elif delta >= 20:
+            # Phase 1: large jump detected, enter pending state
+            self._pending_cycles[device_duid] = {
+                "pump_on": previous_distance,
+                "pump_off": current_distance,
+                "stable_count": 0,
+            }
+            _LOGGER.debug("Device %s: Pump cycle started (jump: %d mm), pump_on candidate: %d mm",
+                          device_duid, int(delta), int(previous_distance))
+
+    def _confirm_pump_cycle(self, device_duid: str, pending: dict, thresholds: dict, reason: str) -> None:
+        """Confirm a detected pump cycle and append to the sliding history window.
+
+        Stores the last PUMP_HISTORY_WINDOW raw pump_on and pump_off readings.
+        Thresholds are computed as the median of all readings in the window, making
+        them robust to outliers without any hard clamps or special-case logic.
+        Works correctly with any number of readings — cold starts use however many
+        cycles have been observed so far.
+
+        Args:
+            device_duid: Device UUID
+            pending: Pending cycle state dict with pump_on and pump_off
+            thresholds: Stored thresholds dict to update in place
+            reason: Human-readable confirmation reason for logging
+        """
+        import statistics
+        import time
+
+        pump_on = int(pending["pump_on"])
+        pump_off = int(pending["pump_off"])
+
+        on_history = thresholds.setdefault("pump_on_history", [])
+        off_history = thresholds.setdefault("pump_off_history", [])
+
+        on_history.append(pump_on)
+        off_history.append(pump_off)
+
+        if len(on_history) > PUMP_HISTORY_WINDOW:
+            on_history.pop(0)
+        if len(off_history) > PUMP_HISTORY_WINDOW:
+            off_history.pop(0)
+
+        thresholds["cycle_count"] = thresholds.get("cycle_count", 0) + 1
+        thresholds["last_cycle"] = time.time()
+
+        median_on = int(statistics.median(on_history))
+        median_off = int(statistics.median(off_history))
+        _LOGGER.info(
+            "Device %s: Pump cycle confirmed (%s) - ON: %d mm, OFF: %d mm (median of %d readings)",
+            device_duid, reason, median_on, median_off, len(on_history),
+        )
+        self.hass.async_create_task(self.async_save_thresholds())
+
+    def _calculate_pump_thresholds(self, device_duid: str) -> dict:
+        """Return pump on/off distance thresholds derived from the sliding history window.
+
+        Computes the median of all stored pump_on and pump_off readings. Works with
+        any number of readings — returns values as soon as at least one cycle has
+        been confirmed. Cold-start readings will be less reliable but improve as the
+        window fills toward PUMP_HISTORY_WINDOW cycles.
+
+        Args:
+            device_duid: Device UUID
+
+        Returns:
+            Dictionary with pump_on_distance, pump_off_distance, and observation count.
+            Empty dict if no pump events detected yet.
+        """
+        import statistics
+
+        if device_duid not in self._pump_thresholds:
+            return {}
+
+        thresholds = self._pump_thresholds[device_duid]
+        on_history = thresholds.get("pump_on_history", [])
+        off_history = thresholds.get("pump_off_history", [])
+
+        if not on_history or not off_history:
+            return {}
+
+        median_on = int(statistics.median(on_history))
+        median_off = int(statistics.median(off_history))
+
+        if median_off <= median_on:
+            return {}
+
+        return {
+            "pump_on_distance": median_on,
+            "pump_off_distance": median_off,
+            "observation_count": len(on_history),
+            "cycle_count": thresholds.get("cycle_count", 0),
+            "pump_on_history": list(on_history),
+            "pump_off_history": list(off_history),
+        }
+
+    async def disconnect_mqtt(self):
+        """Disconnect all MQTT clients."""
+        for device_duid, mqtt_client in self.mqtt_clients.items():
+            try:
+                await mqtt_client.disconnect()
+                _LOGGER.info("Disconnected MQTT for device %s", device_duid)
+            except Exception as err:
+                _LOGGER.error("Error disconnecting MQTT for device %s: %s", device_duid, err)
+        self.mqtt_clients.clear()

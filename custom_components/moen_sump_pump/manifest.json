@@ -1,0 +1,13 @@
+{
+  "domain": "moen_sump_pump",
+  "name": "Moen Smart Water (Sump Pump + Shutoff Valve + Leak Detectors)",
+  "codeowners": ["@patrickjcash", "@jasbir-parmar"],
+  "config_flow": true,
+  "dependencies": ["recorder"],
+  "documentation": "https://github.com/jasbir-parmar/ha-moen-water",
+  "integration_type": "device",
+  "iot_class": "cloud_polling",
+  "issue_tracker": "https://github.com/jasbir-parmar/ha-moen-water/issues",
+  "requirements": ["awsiotsdk>=1.22.0", "boto3>=1.26.0", "httpx[http2]>=0.27.0"],
+  "version": "3.2.0"
+}
